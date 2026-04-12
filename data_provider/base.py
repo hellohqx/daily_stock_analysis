@@ -24,6 +24,7 @@ from typing import Callable, Optional, List, Tuple, Dict, Any
 
 import pandas as pd
 import numpy as np
+from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from .fundamental_adapter import AkshareFundamentalAdapter
 
@@ -667,15 +668,65 @@ class DataFetcherManager:
                     self._fundamental_cache.pop(key, None)
 
     @staticmethod
+    def _try_scalar_isna(value: Any, context: str) -> Optional[bool]:
+        """Return scalar ``pd.isna`` result, or ``None`` when callers should use fallback logic."""
+        if isinstance(value, (dict, list, tuple, set, pd.DataFrame, pd.Series, pd.Index)):
+            return None
+
+        if isinstance(value, np.ndarray):
+            if value.ndim != 0:
+                return None
+            value = value.item()
+
+        try:
+            isna_result = pd.isna(value)
+        except (TypeError, ValueError) as exc:
+            if hasattr(value, "__array__"):
+                logger.debug(
+                    "[%s] pd.isna failed for array-like object; re-raise: value_type=%s error_type=%s",
+                    context,
+                    type(value).__name__,
+                    type(exc).__name__,
+                )
+                raise
+            logger.debug(
+                "[%s] pd.isna fallback: value_type=%s error_type=%s",
+                context,
+                type(value).__name__,
+                type(exc).__name__,
+            )
+            return None
+
+        if isinstance(isna_result, (bool, np.bool_)):
+            return bool(isna_result)
+
+        if isinstance(isna_result, np.ndarray):
+            if isna_result.ndim == 0:
+                return bool(isna_result.item())
+            logger.debug(
+                "[%s] pd.isna returned non-scalar result: value_type=%s result_type=%s",
+                context,
+                type(value).__name__,
+                type(isna_result).__name__,
+            )
+            return None
+
+        logger.debug(
+            "[%s] pd.isna returned unexpected result type: value_type=%s result_type=%s",
+            context,
+            type(value).__name__,
+            type(isna_result).__name__,
+        )
+        return None
+
+    @staticmethod
     def _is_missing_board_value(value: Any) -> bool:
         """Return True when a board field value should be treated as missing."""
         if value is None:
             return True
-        try:
-            if pd.isna(value):
-                return True
-        except Exception:
-            pass
+        is_missing = DataFetcherManager._try_scalar_isna(value, "board_value")
+        if is_missing is True:
+            return True
         text = str(value).strip()
         return text == "" or text.lower() in {"nan", "none", "null", "na", "n/a"}
 
@@ -1394,9 +1445,10 @@ class DataFetcherManager:
         获取股票中文名称（自动切换数据源）
         
         尝试从多个数据源获取股票名称：
-        1. 先从实时行情缓存中获取（如果有）
-        2. 依次尝试各个数据源的 get_stock_name 方法
-        3. 最后尝试让大模型通过搜索获取（需要外部调用）
+        1. 先从内存缓存中获取（如果有）
+        2. 再尝试本地维护映射与 stocks.index.json 索引
+        3. 然后按需查询实时行情
+        4. 依次尝试各个数据源的 get_stock_name 方法
         
         Args:
             stock_code: 股票代码
@@ -1417,6 +1469,13 @@ class DataFetcherManager:
         if cached_name is not None:
             return cached_name
         
+        if is_meaningful_stock_name(static_name, stock_code):
+            return self._cache_stock_name(stock_code, static_name) or static_name
+
+        index_name = get_index_stock_name(stock_code)
+        if is_meaningful_stock_name(index_name, stock_code):
+            return self._cache_stock_name(stock_code, index_name) or index_name
+
         # 2. 尝试从实时行情中获取（最快，可按需禁用）
         if allow_realtime:
             quote = self.get_realtime_quote(raw_stock_code or stock_code, log_final_failure=False)
@@ -1425,9 +1484,6 @@ class DataFetcherManager:
                 self._cache_stock_name(stock_code, name)
                 logger.info(f"[股票名称] 从实时行情获取: {stock_code} -> {name}")
                 return name
-
-        if is_meaningful_stock_name(static_name, stock_code):
-            return self._cache_stock_name(stock_code, static_name) or static_name
 
         # 3. 依次尝试各个数据源
         from .akshare_fetcher import _is_us_code
@@ -1766,13 +1822,27 @@ class DataFetcherManager:
             return normalized not in ("", "-", "nan", "none", "null", "n/a", "na")
         if isinstance(payload, dict):
             return any(DataFetcherManager._has_meaningful_payload(v) for v in payload.values())
+        if isinstance(payload, pd.DataFrame):
+            if payload.empty:
+                return False
+            return any(
+                DataFetcherManager._has_meaningful_payload(v)
+                for v in payload.to_numpy().flat
+            )
+        if isinstance(payload, (pd.Series, pd.Index)):
+            return any(DataFetcherManager._has_meaningful_payload(v) for v in payload.tolist())
+        if isinstance(payload, np.ndarray):
+            if payload.ndim == 0:
+                payload = payload.item()
+            else:
+                return any(
+                    DataFetcherManager._has_meaningful_payload(v)
+                    for v in payload.flat
+                )
         if isinstance(payload, (list, tuple, set)):
             return any(DataFetcherManager._has_meaningful_payload(v) for v in payload)
-        try:
-            if pd.isna(payload):
-                return False
-        except Exception:
-            pass
+        if DataFetcherManager._try_scalar_isna(payload, "fundamental_payload") is True:
+            return False
         return True
 
     @staticmethod
